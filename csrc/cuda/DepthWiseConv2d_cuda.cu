@@ -8,7 +8,7 @@
 
 // For small input computation
 template <typename T>
-__global__ void XDepthWiseConv2dSmallFForward(const T* bottom_data,
+__global__ void DepthWiseConv2dSmallFForward(const T* bottom_data,
     const T* weight_data,
     const T* bias_data,
     const int channels, const int padding, const int height,
@@ -21,50 +21,62 @@ __global__ void XDepthWiseConv2dSmallFForward(const T* bottom_data,
     int c = (blockIdx.z * blockDim.z + threadIdx.z) % channels;
     int dim_in_x = blockDim.x + 2*padding;
     int dim_in_y = blockDim.y + 2*padding;
+    int kernel_num = kernel_size * kernel_size;
     T bias = 0;
     if (bias_data != NULL) {
         bias = bias_data[c];
     }
 
     int z_off = threadIdx.z * dim_in_x * dim_in_y;
-    int shared_z_off = threadIdx.z * kernel_size * kernel_size;
+    int shared_z_off = threadIdx.z * kernel_num;
 
     __shared__ T tmp_shared[8*16*16];
     __shared__ T w_shared[8 * 32];
-    if (tidx < kernel_size * kernel_size && c < channels) {
-        w_shared[shared_z_off + tidx] = weight_data[c * kernel_size * kernel_size + tidx];
+    if (tidx < kernel_num && c < channels) {
+        w_shared[shared_z_off + tidx] = weight_data[c * kernel_num + tidx];
     }
-    for (int i = 0; tidx + i < 16*16; i += blockDim.x * blockDim.y) {
-        tmp_shared[threadIdx.z * 16 * 16 + tidx + i] = 0;
+    for (int i = 0; tidx + i < 256; i += blockDim.x * blockDim.y) {
+        tmp_shared[threadIdx.z * 256 + tidx + i] = 0;
     }
     __syncthreads();
 
-for (int n_off = 0; n_off < batch_size; n_off++) {
-    T sum = 0;
-    if (c < channels) {
-        tmp_shared[z_off + (threadIdx.y + padding)* dim_in_x + threadIdx.x + padding] = bottom_data[(c + n_off * channels) * width * height + (o_idy) * width + o_idx];
-//        printf("tids %d, %d, oid %d, %d, padding %d, width %d, height %d, block %d, %d\n", tidx, tidy, o_idx, o_idy, padding, width, height, blockDim.x, blockDim.y);
-    } else {
-//        tmp_shared[threadIdx.z * blockDim.y * blockDim.x + threadIdx.y * blockDim.x + threadIdx.x] = 0;
-    }
-    __syncthreads();
-//    std::cout << tidx << " " << tidy << " " << " o " << o_idx << "  " << o_idy << " padding " << padding << " " << width << std::endl;
-    if (c < channels) {
-        for (int i = 0; i < kernel_size; i++) {
-            for (int j = 0; j < kernel_size; j++) {
-                sum += tmp_shared[z_off + (threadIdx.y + i) * dim_in_x + threadIdx.x + j] * w_shared[shared_z_off + i * kernel_size + j];
-            }
+    int in_size = width * height;
+    int in_off = c * in_size + (o_idy) * width;
+    int out_size = out_width * out_height;
+    int out_off = c * out_size + (threadIdx.y) * out_width;
+    for (int n_off = 0; n_off < batch_size; n_off++) {
+        T sum = 0;
+        if (c < channels) {
+            tmp_shared[z_off + (threadIdx.y + padding)* dim_in_x + threadIdx.x + padding] = bottom_data[in_off + o_idx];
+    //        printf("tids %d, %d, oid %d, %d, padding %d, width %d, height %d, block %d, %d\n", tidx, tidy, o_idx, o_idy, padding, width, height, blockDim.x, blockDim.y);
+        } else {
+    //        tmp_shared[threadIdx.z * blockDim.y * blockDim.x + threadIdx.y * blockDim.x + threadIdx.x] = 0;
         }
-        sum += bias;
-        //top_data[(c + n_off * channels) * out_width * out_height + (o_idy ) * out_width + o_idx ] = sum + bias;
+        __syncthreads();
+    //    std::cout << tidx << " " << tidy << " " << " o " << o_idx << "  " << o_idy << " padding " << padding << " " << width << std::endl;
+        if (c < channels) {
+            int i_off = shared_z_off;
+            int i_w_off = z_off + threadIdx.y * dim_in_x;
+    
+            for (int i = 0; i < kernel_size; i++) {
+                for (int j = 0; j < kernel_size; j++) {
+                    sum += tmp_shared[i_w_off + threadIdx.x + j] * w_shared[i_off + j];
+                }
+                i_off += kernel_size;
+                i_w_off += dim_in_x;
+            }
+            sum += bias;
+            //top_data[(c + n_off * channels) * out_width * out_height + (o_idy ) * out_width + o_idx ] = sum + bias;
+        }
+        __syncthreads();
+        top_data[out_off + threadIdx.x] = sum;
+        in_off += channels * in_size;
+        out_off += channels * out_size;
     }
-    __syncthreads();
-    top_data[(c + n_off * channels) * out_width * out_height + (threadIdx.y) * out_width + threadIdx.x] = sum;
-}
 }
 
 template <typename T>
-__global__ void DepthWiseConv2dSmallFForward(const T* bottom_data,
+__global__ void XDepthWiseConv2dSmallFForward(const T* bottom_data,
     const T* weight_data,
     const T* bias_data,
     const int channels, const int padding, const int height,
@@ -180,7 +192,7 @@ at::Tensor DepthWiseConv2d_forward_cuda(const at::Tensor& input,
   if (znum > 2048) {
     znum = std::max((2048 / channels) * channels, channels);
   }
-if (out_width > 16) {
+if (out_width > 16 || out_height > 16) {
   dim3 grid(blocks_x, blocks_y, znum);
   dim3 block(blockdim, blockdim);
 
@@ -211,12 +223,11 @@ if (out_width > 16) {
   });
   THCudaCheck(cudaGetLastError());
 } else {
-  blockdim = out_width;
-  auto blocks_x = THCCeilDiv((long)out_width, (long)blockdim);
-  auto blocks_y = THCCeilDiv((long)out_height, (long)blockdim);
+  auto blocks_x = THCCeilDiv((long)out_width, (long)out_width);
+  auto blocks_y = THCCeilDiv((long)out_height, (long)out_height);
  
   dim3 grid(blocks_x, blocks_y, THCCeilDiv((long)channels, 8L));
-  dim3 block(blockdim, blockdim, 8);
+  dim3 block(out_width, out_height, 8);
   printf("blockdim %d, %d, %d, griddim %d, %d, %d outputsize %d\n", block.x, block.y, block.z, grid.x, grid.y, grid.z, batch_size);
   AT_DISPATCH_FLOATING_TYPES(input.type(), "DepthWiseConv2dSmall_forward", [&] {
     DepthWiseConv2dSmallFForward<scalar_t><<<grid, block, 0, stream>>>(
