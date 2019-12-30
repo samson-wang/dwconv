@@ -29,61 +29,62 @@ __global__ void DepthWiseConv2dSmallFForward(const T* bottom_data,
     __shared__ T tmp_shared[8*16*16];
 
     // Initialize tmp shared for input data
-    for (int off = 0; off < 256; off += thread_num) {
-        if (off + tidx < 256) {
-            tmp_shared[threadIdx.z * thread_num + off + tidx] = T(0);
-        }
+    for (int off = threadIdx.z * thread_num + tidx; off < 8 * 256; off += thread_num) {
+        tmp_shared[off] = T(0);
     }
-        // Load kernels into shared memory
-            int c = tidz % channels;
-            for (int off = 0; off < kernel_num; off += thread_num) {
-                if (off + tidx < kernel_num) {
-                    w_shared[threadIdx.z * kernel_num + off + tidx] = weight_data[c * kernel_num + off + tidx];
-                }
-            }
+
         T bias = T(0);
-        if (bias_data != NULL) bias = bias_data[c];
+//        if (bias_data != NULL) bias = bias_data[c];
 
     __syncthreads();
     int bound = batch_size * channels;
-    int n_steps = blockDim.z * gridDim.z;
+    int n_steps = channels;
     int pidx = pad_width * (threadIdx.y + padding) + threadIdx.x + padding;
     int opidx = pad_width * threadIdx.y + threadIdx.x;
     int thread_pad_num = pad_width * blockDim.y;
+    int bd_off = 0;
+    int tmp_p_off = threadIdx.z * pad_num;
+    int tmp_w_off = threadIdx.z * kernel_num;
     for (int n_off = 0; n_off < bound; n_off += n_steps) {
         int n_z = n_off + tidz;
         int c = n_z % channels;
+        int c_off = c * kernel_num;
         if (n_z < bound) {
-        // Load input data input shared memory, pay attention to the padding.
-            int p_off = 0;
-            for (int off = 0; off < in_num; off += thread_num) {
-                if (off + tidx < in_num) {
-                    tmp_shared[threadIdx.z * pad_num + p_off + pidx] = bottom_data[n_z * in_num + off + tidx];
-                }
-                p_off += thread_pad_num;
+        // Load kernels into shared memory
+            for (int off = tidx; off < kernel_num; off += thread_num) {
+                w_shared[tmp_w_off + off] = weight_data[c_off + off];
             }
+
+        // Load input data input shared memory, pay attention to the padding.
+            int tmp_off = tidx + n_z * in_num;
+            tmp_shared[tmp_p_off + pidx] = bottom_data[tmp_off];
         }
-/*
+
+        __syncthreads();
+        /*
         if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
-            for (int z = 0; z < bound; z++) {
+            for (int z = 0; z < channels; z++) {
             for (int i = 0; i < pad_height; i++) {
                 for (int j = 0; j < pad_width; j++) {
                     printf("%f ", tmp_shared[z * pad_num + i*pad_width + j]);
                 }
-                printf("\n");
+                printf("\n %d \n", z);
             }
             }
         }
-*/
-        __syncthreads();
+        */
 
         if (n_z < bound) {
             // To do the math
             T sum = T(0);
-            for (int i = 0; i < kernel_size; i++) {
+            int i_poff = tmp_p_off + opidx;
+            #pragma unroll
+            for (int i = tmp_w_off; i < kernel_num + tmp_w_off; i+= kernel_size) {
+                #pragma unroll
                 for (int j = 0; j < kernel_size; j++) {
-                    sum += tmp_shared[threadIdx.z * pad_num + i * pad_width + opidx + j] * w_shared[threadIdx.z * kernel_num + i * kernel_size + j];
+                    sum += tmp_shared[i_poff + j] * w_shared[i + j];
                 }
+                i_poff += pad_width;
             }
             sum += bias;
             top_data[n_z * out_num + tidx] = sum;
@@ -244,7 +245,7 @@ if (out_width > 16 || out_height > 16) {
   auto blocks_x = 1;
   auto blocks_y = 1;
  
-  dim3 grid(blocks_x, blocks_y, THCCeilDiv((long)channels, 8L));
+  dim3 grid(blocks_x, blocks_y, THCCeilDiv((long)channels, 2*8L));
   dim3 block(out_width, dimy, 8);
   printf("blockdim %d, %d, %d, griddim %d, %d, %d outputsize %d\n", block.x, block.y, block.z, grid.x, grid.y, grid.z, batch_size);
   AT_DISPATCH_FLOATING_TYPES(input.type(), "DepthWiseConv2dSmall_forward", [&] {
