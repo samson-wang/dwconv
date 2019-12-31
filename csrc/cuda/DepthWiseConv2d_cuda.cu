@@ -7,24 +7,28 @@
 #include <THC/THCDeviceUtils.cuh>
 
 // For small input computation
-template <typename T>
+template <typename T, int FixedKernelSize>
 __global__ void DepthWiseConv2dSmallFForward(const T* bottom_data,
     const T* weight_data,
     const T* bias_data,
     const int channels, const int padding, const int height,
-    const int width, const int kernel_size,
+    const int width, const int in_kernel_size,
     const int out_height, const int out_width, const int batch_size,
     T* top_data) {
-    int in_num = height * width;
-    int out_num = out_height * out_width;
-    int pad_height = height + padding*2;
-    int pad_width = width + padding*2;
-    int pad_num = pad_height * pad_width;
-    int kernel_num = kernel_size * kernel_size;
-    int thread_num = blockDim.x * blockDim.y;
+    const int in_num = height * width;
+    const int out_num = out_height * out_width;
+    const int pad_height = height + padding*2;
+    const int pad_width = width + padding*2;
+    const int pad_num = pad_height * pad_width;
+    const int kernel_size = FixedKernelSize > 0 ? FixedKernelSize : in_kernel_size;
+    const int kernel_num = kernel_size * kernel_size;
+    const int thread_num = blockDim.x * blockDim.y;
+    const int n_steps = blockDim.z * gridDim.z;
+    const int out_num_total = n_steps * out_num;
+    const int in_num_total = n_steps * in_num;
 
-    int tidz = threadIdx.z + blockDim.z * blockIdx.z;
-    int tidx = blockDim.x * threadIdx.y + threadIdx.x;
+    const int tidz = threadIdx.z + blockDim.z * blockIdx.z;
+    const int tidx = blockDim.x * threadIdx.y + threadIdx.x;
     __shared__ T w_shared[8*32];
     __shared__ T tmp_shared[8*16*16];
 
@@ -37,14 +41,16 @@ __global__ void DepthWiseConv2dSmallFForward(const T* bottom_data,
 //        if (bias_data != NULL) bias = bias_data[c];
 
     __syncthreads();
-    int bound = batch_size * channels;
-    int n_steps = channels;
-    int pidx = pad_width * (threadIdx.y + padding) + threadIdx.x + padding;
-    int opidx = pad_width * threadIdx.y + threadIdx.x;
-    int thread_pad_num = pad_width * blockDim.y;
-    int bd_off = 0;
+    const int bound = batch_size * channels;
+    const int pidx = pad_width * (threadIdx.y + padding) + threadIdx.x + padding;
+    const int opidx = pad_width * threadIdx.y + threadIdx.x;
     int tmp_p_off = threadIdx.z * pad_num;
     int tmp_w_off = threadIdx.z * kernel_num;
+    int tmp_off = tidx + tidz * in_num;
+    int tmp_out_off = threadIdx.y * out_width + threadIdx.x + tidz * out_num;
+    int half_pad_off = pad_width * blockDim.y;
+    int half_in_off = width * blockDim.y;
+    int half_out_off = out_width * blockDim.y;
     for (int n_off = 0; n_off < bound; n_off += n_steps) {
         int n_z = n_off + tidz;
         int c = n_z % channels;
@@ -56,39 +62,65 @@ __global__ void DepthWiseConv2dSmallFForward(const T* bottom_data,
             }
 
         // Load input data input shared memory, pay attention to the padding.
-            int tmp_off = tidx + n_z * in_num;
             tmp_shared[tmp_p_off + pidx] = bottom_data[tmp_off];
+            if ((threadIdx.y + blockDim.y < height)) {
+                tmp_shared[tmp_p_off + pidx + half_pad_off] = bottom_data[tmp_off + half_in_off];
+            }
         }
 
         __syncthreads();
         /*
         if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+            printf("nz %d, bound %d, n_steps %d, n_off %d, blockDim.z %d, gridDim.z %d\n", n_z, bound, n_steps, n_off, blockDim.z, gridDim.z);
+        }
+
+        if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
             for (int z = 0; z < channels; z++) {
-            for (int i = 0; i < pad_height; i++) {
-                for (int j = 0; j < pad_width; j++) {
+            for (int i = 0; i < pad_height + kernel_size ; i++) {
+                for (int j = 0; j < pad_width + kernel_size ; j++) {
                     printf("%f ", tmp_shared[z * pad_num + i*pad_width + j]);
                 }
-                printf("\n %d \n", z);
+                printf("\n");
             }
+                printf("%d \n", z);
+            }
+            for (int z = 0; z < channels; z++) {
+                for (int i = 0; i < kernel_size; i++) {
+                    for (int j = 0; j < kernel_size; j++) {
+                        printf("%f ", w_shared[z * kernel_num + i * kernel_size + j]);
+                    }
+                    printf("\n");
+                }
             }
         }
         */
 
-        if (n_z < bound) {
+        if (n_z < bound && threadIdx.x < out_width && threadIdx.y < out_height) {
             // To do the math
             T sum = T(0);
+            T sum1 = T(0);
             int i_poff = tmp_p_off + opidx;
             #pragma unroll
-            for (int i = tmp_w_off; i < kernel_num + tmp_w_off; i+= kernel_size) {
+            for (int i = 0; i < kernel_num; i+= kernel_size) {
                 #pragma unroll
                 for (int j = 0; j < kernel_size; j++) {
-                    sum += tmp_shared[i_poff + j] * w_shared[i + j];
+                    const T f = w_shared[i + tmp_w_off + j];
+                    sum += tmp_shared[i_poff + j] * f;
+                    if ((threadIdx.y + blockDim.y < out_height)) {
+                        sum1 += tmp_shared[i_poff + j + half_pad_off] * f;
+                    }
                 }
                 i_poff += pad_width;
             }
-            sum += bias;
-            top_data[n_z * out_num + tidx] = sum;
+//            sum += bias;
+            top_data[tmp_out_off] = sum;
+            if ((threadIdx.y + blockDim.y < out_height)) {
+                top_data[tmp_out_off + half_out_off] = sum1;
+                //printf("top data %d, %d, %d, %d\n", threadIdx.x, threadIdx.y, tmp_out_off, half_out_off);
+            }
         }
+        tmp_off += in_num_total;
+        tmp_out_off += out_num_total;
         __syncthreads();
     }
 }
@@ -102,7 +134,6 @@ __global__ void XDepthWiseConv2dSmallFForward(const T* bottom_data,
     const int out_height, const int out_width, const int batch_size,
     T* top_data) {
     __shared__ T tmp_shared[8*16*16];
-    int tidx = threadIdx.y * blockDim.x + threadIdx.x;
     int c = (blockIdx.z * blockDim.z + threadIdx.z) % channels;
 
     int z_off = threadIdx.z * blockDim.x * blockDim.y;
@@ -194,9 +225,9 @@ at::Tensor DepthWiseConv2d_forward_cuda(const at::Tensor& input,
 
   auto output = at::empty({batch_size, channels, out_height, out_width}, input.options());
   auto blockdim = 32;
-  if (out_width < kernel_size && out_width < 32) {
+  if (out_width < kernel_size && out_width + kernel_size - 1 < 32) {
     blockdim = kernel_size;
-  } else if (out_width < 32) {
+  } else if (out_width + kernel_size - 1 < 32) {
     blockdim = out_width + kernel_size - 1;
   }
   auto blocks_x = THCCeilDiv((long)out_width, blockdim-kernel_size+1L);
@@ -210,7 +241,7 @@ at::Tensor DepthWiseConv2d_forward_cuda(const at::Tensor& input,
   if (znum > 2048) {
     znum = std::max((2048 / channels) * channels, channels);
   }
-if (out_width > 16 || out_height > 16) {
+if (width + 2*padding > 16 || height + 2 * padding> 16) {
   dim3 grid(blocks_x, blocks_y, znum);
   dim3 block(blockdim, blockdim);
 
@@ -224,6 +255,8 @@ if (out_width > 16 || out_height > 16) {
   //  return output;
   //}
 //niu
+//  printf("blockdim %d, %d, %d, griddim %d, %d, %d outputsize %d, channels %d, width %d, height %d, padding %d, stride %d, bias %s, kernel_size %d\n", block.x, block.y, block.z, grid.x, grid.y, grid.z, batch_size, channels, width, height, padding, stride, bias.size(0), kernel_size);
+
   AT_DISPATCH_FLOATING_TYPES(input.type(), "DepthWiseConv2d_forward", [&] {
     DepthWiseConv2dFForward<scalar_t><<<grid, block, 0, stream>>>(
          input.contiguous().data<scalar_t>(),
@@ -241,15 +274,16 @@ if (out_width > 16 || out_height > 16) {
   });
   THCudaCheck(cudaGetLastError());
 } else {
-  auto dimy = THCCeilDiv((long)out_height, 1L);
+  auto dimy = THCCeilDiv((long)height, 2L);
   auto blocks_x = 1;
   auto blocks_y = 1;
  
-  dim3 grid(blocks_x, blocks_y, THCCeilDiv((long)channels, 2*8L));
-  dim3 block(out_width, dimy, 8);
-  printf("blockdim %d, %d, %d, griddim %d, %d, %d outputsize %d\n", block.x, block.y, block.z, grid.x, grid.y, grid.z, batch_size);
+  dim3 grid(blocks_x, blocks_y, THCCeilDiv((long)channels*batch_size, 64L));
+  dim3 block(width, dimy, 8);
+//  printf("Small blockdim %d, %d, %d, griddim %d, %d, %d outputsize %d, channels %d, width %d, height %d, padding %d, stride %d, bias %s, kernel_size %d\n", block.x, block.y, block.z, grid.x, grid.y, grid.z, batch_size, channels, width, height, padding, stride, bias.size(0), kernel_size);
+if (kernel_size == 3) {
   AT_DISPATCH_FLOATING_TYPES(input.type(), "DepthWiseConv2dSmall_forward", [&] {
-    DepthWiseConv2dSmallFForward<scalar_t><<<grid, block, 0, stream>>>(
+    DepthWiseConv2dSmallFForward<scalar_t, 3><<<grid, block, 0, stream>>>(
          input.contiguous().data<scalar_t>(),
          weight.contiguous().data<scalar_t>(),
          bias.contiguous().data<scalar_t>(),
@@ -263,6 +297,40 @@ if (out_width > 16 || out_height > 16) {
          batch_size,
          output.data<scalar_t>());
   });
+} else if (kernel_size == 5) {
+  AT_DISPATCH_FLOATING_TYPES(input.type(), "DepthWiseConv2dSmall_forward", [&] {
+    DepthWiseConv2dSmallFForward<scalar_t, 5><<<grid, block, 0, stream>>>(
+         input.contiguous().data<scalar_t>(),
+         weight.contiguous().data<scalar_t>(),
+         bias.contiguous().data<scalar_t>(),
+         channels,
+         padding,
+         height,
+         width,
+         kernel_size,
+         out_height,
+         out_width,
+         batch_size,
+         output.data<scalar_t>());
+  });
+} else {
+  AT_DISPATCH_FLOATING_TYPES(input.type(), "DepthWiseConv2dSmall_forward", [&] {
+    DepthWiseConv2dSmallFForward<scalar_t, 0><<<grid, block, 0, stream>>>(
+         input.contiguous().data<scalar_t>(),
+         weight.contiguous().data<scalar_t>(),
+         bias.contiguous().data<scalar_t>(),
+         channels,
+         padding,
+         height,
+         width,
+         kernel_size,
+         out_height,
+         out_width,
+         batch_size,
+         output.data<scalar_t>());
+  });
+
+}
   THCudaCheck(cudaGetLastError());
 
 }
