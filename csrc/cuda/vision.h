@@ -11,7 +11,7 @@ at::Tensor DepthWiseConv2d_forward_cuda(const at::Tensor& input,
                                 const int dilation,
                                 const int groups);
 
-std::vector<at::Tensor> DepthWiseConv2d_forward_cuda(const at::Tensor& grad,
+std::vector<at::Tensor> DepthWiseConv2d_backward_cuda(const at::Tensor& grad,
                                 const at::Tensor& input,
                                 const at::Tensor& weight,
                                 const at::Tensor& bias,

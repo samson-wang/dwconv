@@ -10,37 +10,35 @@ from torch.nn.modules.utils import _pair
 class _DepthWiseConv2d(Function):
     @staticmethod
     def forward(ctx, input, weight, bias, stride, padding, dilation, groups):
-        #ctx.output_size = _pair(output_size)
-        #ctx.spatial_scale = spatial_scale
-        #ctx.input_shape = input.size()
-        output = _C.depth_wise_conv2d(
+        ctx.input_shape = input.size()
+        groups = ctx.input_shape[1]
+        ctx.params = (stride, padding, dilation, groups)
+        assert groups == ctx.input_shape[1], "Groups {} must equal to input channels {}" . format(groups, ctx.input_shape[1])
+        assert groups == weight.size(0), "Groups {} must equal to weight ouput channels {}" . format(groups, weight.size(0))
+        assert dilation == 1, "Not support dilation conv"
+        output = _C.depth_wise_conv2d_forward(
             input, weight, bias, stride, padding, dilation, groups
         )
-        #ctx.save_for_backward(input, roi, argmax)
+        ctx.save_for_backward(input, weight, bias)
         return output
 
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_output):
-        raise
-        input, rois, argmax = ctx.saved_tensors
-        output_size = ctx.output_size
-        spatial_scale = ctx.spatial_scale
+        input, weight, bias = ctx.saved_tensors
         bs, ch, h, w = ctx.input_shape
-        grad_input = _C.roi_pool_backward(
+        stride, padding, dilation, groups = ctx.params
+        grad_input, grad_weight, grad_bias = _C.depth_wise_conv2d_backward(
             grad_output,
             input,
-            rois,
-            argmax,
-            spatial_scale,
-            output_size[0],
-            output_size[1],
-            bs,
-            ch,
-            h,
-            w,
+            weight,
+            bias,
+            stride,
+            padding,
+            dilation,
+            groups
         )
-        return grad_input, None, None, None
+        return grad_input, grad_weight, grad_bias, None, None, None, None
 
 
 depth_wise_conv2d = _DepthWiseConv2d.apply

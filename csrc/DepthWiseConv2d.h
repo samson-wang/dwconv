@@ -26,7 +26,7 @@ at::Tensor DepthWiseConv2d_forward(const at::Tensor& input,
   AT_ERROR("Not implemented on the CPU");
 }
 
-at::Tensor DepthWiseConv2d_backward(const at::Tensor& grad,
+std::vector<at::Tensor> DepthWiseConv2d_backward(const at::Tensor& grad,
                                  const at::Tensor& input,
                                  const at::Tensor& weight,
                                  const at::Tensor& bias,
