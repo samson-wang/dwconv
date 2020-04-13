@@ -182,7 +182,6 @@ for (int n_off = 0; n_off < output_size; n_off += gridDim.z) {
 }
 }
 
-/*
 template <typename T>
 __global__ void DepthWiseConv2dLargeFForward(const T* bottom_data,
     const T* weight_data,
@@ -191,112 +190,45 @@ __global__ void DepthWiseConv2dLargeFForward(const T* bottom_data,
     const int width, const int kernel_size,
     const int out_height, const int out_width, const int batch_size,
     T* top_data) {
-    __shared__ T tmp_shared[16*16];
-    __shared__ T w_shared[16*16];
-    __shared__ T r_shared[16*16];
-    __shared__ T o_shared[16*16];
-    int tidx = threadIdx.x + blockDim.x * threadIdx.y;
-    for (; tidx < 256; tidx += blockDim.x * blockDim.y) {
-        //r_shared[tidx] = 0;
-        o_shared[tidx] = 0;
-        //w_shared[tidx] = 0;
-        //tmp_shared[tidx] = 0;
-    }
-    __syncthreads();
+    __shared__ T true_r_shared[32*32];
+    int n_idx = blockIdx.x * blockDim.y + threadIdx.y;
+    const int n_num = gridDim.x * blockDim.y;
 
-    // Iterate over input and weight
-    const int comp_width = blockDim.x - out_width;
-    const int comp_height = blockDim.y - out_height;
-    const int kernel_num = kernel_size * kernel_size;
-    int in_off_x = threadIdx.x;
-    int in_off_y = threadIdx.y;
-    const int wc_off = blockIdx.x * kernel_num;
-    const int input_off = blockIdx.x * width * height + blockIdx.z * width * height * channels;
-    const int output_off = blockIdx.x * out_width * out_height + blockIdx.z * out_width * out_height * channels;
-    for (int off_y = 0; off_y < kernel_size; off_y += comp_height) {
-        for (int off_x = 0; off_x < kernel_size; off_x += comp_width) {
-            // load current weight patch
-            if (in_off_x < kernel_size && in_off_y < kernel_size && threadIdx.x < comp_width && threadIdx.y < comp_height) {
-                w_shared[threadIdx.x + threadIdx.y * blockDim.x] = weight_data[in_off_x + in_off_y * kernel_size + wc_off];
-            } else {
-                w_shared[threadIdx.x + threadIdx.y * blockDim.x] = 0;
-            }
-            // load current input patch
-            if (in_off_x >= padding && in_off_y >= padding && in_off_x < width + padding && in_off_y < height + padding) {
-                tmp_shared[threadIdx.x + threadIdx.y * blockDim.x] = bottom_data[in_off_x - padding + (in_off_y - padding) * width + input_off];
-            } else {
-                tmp_shared[threadIdx.x + threadIdx.y * blockDim.x] = 0;
-            }
-            __syncthreads();
-
-            /*
-            if (threadIdx.x == 0 && threadIdx.y == 0) {
-                printf("NOW on %d, %d\n %d %d\n ", off_x, off_y, in_off_x, in_off_y);
-                for (int i = 0; i < 16; i++) {
-                    for (int j = 0; j < 16; j++) {
-                        printf("%f ", tmp_shared[j + i * blockDim.x]);
-                    }
-                    printf("\n");
-                }
-            }
-            * /
-            // Do computation
-            for (int i = 0; i < out_height; i++) {
-                for (int j = 0; j < out_width; j++) {
-                    if (threadIdx.x < comp_width && threadIdx.y < comp_height) {
-                        r_shared[threadIdx.x + threadIdx.y * blockDim.x] = w_shared[threadIdx.x + threadIdx.y * blockDim.x] * tmp_shared[threadIdx.x + j + (threadIdx.y + i) * blockDim.x];
-                    } else {
-                        r_shared[threadIdx.x + threadIdx.y * blockDim.x] = 0;
-                    }
-                    __syncthreads();
-                    if (threadIdx.y == 0) {
-                        for (int k = 1; k < 16; k++) {
-                            r_shared[threadIdx.x] += r_shared[threadIdx.x + k * blockDim.x];
-                        }
-                    }
-                    __syncthreads();
-                    if (threadIdx.x == 0 && threadIdx.y == 0) {
-                        for (int k = 0; k < 16; k++) {
-                            o_shared[j + i * out_width] += r_shared[k];
-                        }
-                    }
-                    __syncthreads();
-                }
-            }
-            in_off_x += comp_width;
-        }
-        /*
-        if (threadIdx.x == 0 && threadIdx.y == 0) {
-            printf("\n%d %d %d %d %d %d\n", width, height, comp_width, comp_height, in_off_x, in_off_y);
-        }
-        * /
-        in_off_x = threadIdx.x;
-        in_off_y += comp_height;
-        __syncthreads();
-    }
-    __syncthreads();
-    if (threadIdx.x < out_width && threadIdx.y < out_height) {
-        top_data[output_off + threadIdx.y * out_width + threadIdx.x] = o_shared[threadIdx.y * out_width + threadIdx.x];
-    }
-}
-*/
-
-template <typename T>
-__global__ void DepthWiseConv2dLargeFForward(const T* bottom_data,
-    const T* weight_data,
-    const T* bias_data,
-    const int channels, const int padding, const int height,
-    const int width, const int kernel_size,
-    const int out_height, const int out_width, const int batch_size,
-    T* top_data) {
-    __shared__ T r_shared[32*32];
+while (n_idx < channels * batch_size) {
+    T* r_shared = true_r_shared;
     T sum[8] = {0};
     T tmp = 0;
-    const int y_num = (kernel_size / 8) * 8;
-    const int c = blockIdx.x % channels;
-    const T* data = bottom_data + blockIdx.x * width * height + (blockIdx.y - padding) * width + blockIdx.z - padding;
-    const T* weight = weight_data + c * kernel_size * kernel_size;
-    for (int tidx = threadIdx.x; tidx < kernel_size; tidx += blockDim.x) {
+    const int c = n_idx % channels;
+    int valid_kernel_w = kernel_size;
+    int valid_kernel_h = kernel_size;
+    T* data = const_cast<T*> (bottom_data);
+    data = data + n_idx * width * height;
+    T* weight = const_cast<T*> (weight_data);
+    weight = weight + c * kernel_size * kernel_size;
+    const int y_shift = blockIdx.y - padding;
+    const int x_shift = blockIdx.z - padding;
+    if (blockIdx.y < padding) {
+        valid_kernel_h = valid_kernel_h + y_shift;
+        weight = weight - y_shift * kernel_size;
+    } else if (blockIdx.y >= out_height - padding) {
+        valid_kernel_h = valid_kernel_h - (blockIdx.y - out_height + padding + 1);
+        data = data + y_shift * width;
+    } else {
+        data = data + y_shift * width;
+    }
+    if (blockIdx.z < padding) {
+        valid_kernel_w = valid_kernel_w + x_shift;
+        weight = weight - x_shift;
+    } else if (blockIdx.z >= out_width - padding) {
+        valid_kernel_w = valid_kernel_w - (blockIdx.z - out_width + padding + 1);
+        data = data + x_shift;
+    } else {
+        data = data + x_shift;
+    }
+
+    const int y_num = (valid_kernel_h / 8) * 8;
+    r_shared = r_shared + threadIdx.y * blockDim.x;
+    for (int tidx = threadIdx.x; tidx < valid_kernel_w; tidx += blockDim.x) {
         int tmp_tidx_d = tidx;
         int tmp_tidx_w = tidx;
         for (int tidy = 0; tidy < y_num; tidy += 8) {
@@ -307,7 +239,7 @@ __global__ void DepthWiseConv2dLargeFForward(const T* bottom_data,
             tmp_tidx_d = tmp_tidx_d + 8 * width;
             tmp_tidx_w = tmp_tidx_w + 8 * kernel_size;
         }
-        for (int j = 0; j < kernel_size - y_num; j++) {
+        for (int j = 0; j < valid_kernel_h - y_num; j++) {
             sum[j] += data[j * width + tmp_tidx_d] * weight[j * kernel_size + tmp_tidx_w];
         }
     }
@@ -329,9 +261,11 @@ __global__ void DepthWiseConv2dLargeFForward(const T* bottom_data,
         for (int j = 1; j < 32; j++) {
             tmp += r_shared[j];
         }
-        top_data[blockIdx.x * out_width * out_height + blockIdx.y * out_width + blockIdx.z] = tmp;
+        top_data[n_idx * out_width * out_height + blockIdx.y * out_width + blockIdx.z] = tmp;
     }
     __syncthreads();
+    n_idx += n_num;
+}
 }
 
 at::Tensor DepthWiseConv2d_forward_cuda(const at::Tensor& input,
@@ -373,8 +307,11 @@ at::Tensor DepthWiseConv2d_forward_cuda(const at::Tensor& input,
     znum = std::max((2048 / channels) * channels, channels);
   }
 if (kernel_size > 16) {
-    dim3 grid(channels * batch_size, out_height, out_width);
-    dim3 block(kernel_size, 1);
+    int blocks_x = kernel_size <= 1024 ? kernel_size : 1024;
+    int blocks_y = (1024) / blocks_x;
+    //dim3 grid((channels * batch_size + blocks_y - 1) / blocks_y, out_height, out_width);
+    dim3 grid((channels * batch_size) / blocks_y / 2, out_height, out_width);
+    dim3 block(blocks_x, blocks_y);
   AT_DISPATCH_FLOATING_TYPES(input.type(), "DepthWiseConv2d_forward", [&] {
     DepthWiseConv2dLargeFForward<scalar_t><<<grid, block, 0, stream>>>(
          input.contiguous().data<scalar_t>(),
